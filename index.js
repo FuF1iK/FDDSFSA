@@ -129,6 +129,17 @@ function extractRosterFromHtml(html) {
 async function fetchFamilyData(familyId, server) {
   const url  = `https://fletcher-wiki.com/players-family-stats/family/${familyId}?server=${server}`;
   const html = await fetchWithAntiDDOS(url);
+
+  // Отладочный вывод — поможет понять что возвращает сайт
+  console.log('=== DEBUG ===');
+  console.log('HTML length:', html.length);
+  console.log('Has __next_f:', html.includes('__next_f'));
+  console.log('Has roster:', html.includes('roster'));
+  console.log('Has Проверяем:', html.includes('Проверяем'));
+  console.log('Has R3ACTLB:', html.includes('R3ACTLB'));
+  console.log('First 300 chars:', html.slice(0, 300));
+  console.log('=============');
+
   if (!html.includes('__next_f') && !html.includes('roster')) {
     throw new Error('Страница не загрузилась корректно. Попробуйте позже.');
   }

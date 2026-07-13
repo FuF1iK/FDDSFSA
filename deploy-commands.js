@@ -9,7 +9,7 @@ const commands = [
       opt.setName('url').setDescription('Ссылка на профиль семьи (fletcher-wiki.com)').setRequired(true)
     )
     .addStringOption(opt =>
-      opt.setName('period').setDescription('Период: week (неделя), month (месяц), season (сезон)').setRequired(false)
+      opt.setName('period').setDescription('Период статистики').setRequired(false)
         .addChoices(
           { name: 'Неделя', value: 'week' },
           { name: 'Месяц',  value: 'month' },
@@ -34,11 +34,23 @@ const commands = [
 
 const rest = new REST().setToken(process.env.DISCORD_TOKEN);
 
+const GUILD_IDS = [
+  '1171000043587784774',
+  '1100442923830628455',
+  '1519513310519759029',
+];
+
 (async () => {
   try {
-    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
-    console.log('Команды успешно зарегистрированы.');
+    for (const guildId of GUILD_IDS) {
+      await rest.put(
+        Routes.applicationGuildCommands(process.env.CLIENT_ID, guildId),
+        { body: commands }
+      );
+      console.log(`✅ Команды зарегистрированы для сервера ${guildId}`);
+    }
+    console.log('Готово — команды появятся во всех трёх серверах мгновенно.');
   } catch (err) {
-    console.error(err);
+    console.error('Ошибка:', err.message);
   }
 })();

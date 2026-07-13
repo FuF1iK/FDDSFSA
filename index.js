@@ -97,10 +97,33 @@ function parseFamilyUrl(url) {
 }
 
 function extractRosterFromHtml(html) {
-  // Данные встроены в Next.js RSC payload: "roster":[{...}]
-  const match = html.match(/"roster":\[(\{.+?\}(?:,\{.+?\})*)\]/);
-  if (!match) throw new Error('Список игроков не найден на странице');
-  return JSON.parse('[' + match[1] + ']');
+  // Данные встроены в Next.js RSC payload внутри self.__next_f.push([1, "..."])
+  // Строка внутри двойно-экранирована, поэтому сначала парсим её через JSON.parse
+  const pushes = [...html.matchAll(/self\.__next_f\.push\(\[1,(".*?")\]\)<\/script>/gs)]
+    .map(m => m[1]);
+
+  for (const raw of pushes) {
+    if (!raw.includes('roster')) continue;
+    let s;
+    try { s = JSON.parse(raw); } catch { continue; }
+
+    const key = '"roster":[';
+    const idx = s.indexOf(key);
+    if (idx === -1) continue;
+
+    // Считаем скобки чтобы найти конец массива
+    const start = idx + key.length - 1; // позиция '['
+    let depth = 0, end = start;
+    for (let i = start; i < s.length; i++) {
+      if (s[i] === '[') depth++;
+      else if (s[i] === ']') { depth--; if (depth === 0) { end = i + 1; break; } }
+    }
+    try {
+      const roster = JSON.parse(s.slice(start, end));
+      if (Array.isArray(roster) && roster.length > 0) return roster;
+    } catch { continue; }
+  }
+  throw new Error('Список игроков не найден на странице. Попробуйте позже.');
 }
 
 async function fetchFamilyData(familyId, server) {

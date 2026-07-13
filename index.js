@@ -1,20 +1,14 @@
 require('dotenv').config();
-const {
-  Client,
-  GatewayIntentBits,
-  EmbedBuilder,
-} = require('discord.js');
-
-// Поддержка fetch на старых версиях Node.js (< 18)
-const fetchFn = globalThis.fetch ?? require('node-fetch');
+const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
 const watches = new Map();
 
 const MAX_COL_WIDTH  = 12;
 const MAX_LINE_WIDTH = 52;
 const MAX_DESC_LEN   = 3800;
+
+const fetchFn = globalThis.fetch ?? require('node-fetch');
 
 // ---------- Проверка прав по ролям ----------
 
@@ -26,22 +20,8 @@ function hasPermission(interaction) {
   return interaction.member.roles.cache.some(r => allowedRoles.includes(r.id));
 }
 
-// ---------- API fletcher-wiki ----------
+// ---------- Парсинг данных из HTML страницы ----------
 
-async function fetchFamilyStats(familyId, server, period = 'week') {
-  // period: 'week' | 'month' | 'season'
-  const url = `https://fletcher-wiki.com/api/family-stats/roster?familyId=${familyId}&server=${server}&period=${period}`;
-  const res  = await fetchFn(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0',
-      'Accept': 'application/json',
-    }
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
-}
-
-// Разбирает ссылку вида .../family/1983?server=ru7 → { familyId, server }
 function parseFamilyUrl(url) {
   const m = url.match(/\/family\/(\d+)/);
   const s = url.match(/[?&]server=([^&]+)/);
@@ -49,13 +29,37 @@ function parseFamilyUrl(url) {
   return { familyId: m[1], server: s ? s[1] : 'ru7' };
 }
 
+async function fetchFamilyData(familyId, server) {
+  const url = `https://fletcher-wiki.com/players-family-stats/family/${familyId}?server=${server}`;
+  const res = await fetchFn(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'ru-RU,ru;q=0.9',
+    }
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const html = await res.text();
+
+  // Данные встроены в HTML как Next.js RSC payload
+  // Ищем JSON с initialData
+  const match = html.match(/\"initialData\":\{\"family\":\{(.+?)\},\"roster\":\[(.+?)\]\}/);
+  if (!match) {
+    // Запасной вариант: ищем roster напрямую
+    const rosterMatch = html.match(/\"roster\":\[(\{.+?\}(?:,\{.+?\})*)\]/);
+    if (!rosterMatch) throw new Error('Не удалось найти данные на странице. Возможно, сайт заблокировал запрос.');
+    return { roster: JSON.parse('[' + rosterMatch[1] + ']'), family: null };
+  }
+
+  const roster = JSON.parse('[' + match[2] + ']');
+  return { roster, family: null };
+}
+
 // ---------- Форматирование таблицы ----------
 
 function formatTable(rows, headerRowCount = 0) {
   if (!rows || rows.length === 0) return null;
-
   const clip = (text, max) => String(text || '').replace(/`/g, "'").slice(0, max);
-
   const colCount  = Math.max(...rows.map(r => r.length));
   const colWidths = Array(colCount).fill(0);
   for (const row of rows) {
@@ -63,8 +67,7 @@ function formatTable(rows, headerRowCount = 0) {
       colWidths[i] = Math.max(colWidths[i], clip(cell, MAX_COL_WIDTH).length);
     });
   }
-
-  const sepW = (colCount - 1) * 3;
+  const sepW  = (colCount - 1) * 3;
   const total = colWidths.reduce((a, b) => a + b, 0);
   if (total + sepW > MAX_LINE_WIDTH) {
     const budget = MAX_LINE_WIDTH - sepW;
@@ -73,29 +76,24 @@ function formatTable(rows, headerRowCount = 0) {
       colWidths[i] = Math.max(i === 0 ? 2 : 1, Math.floor(colWidths[i] * scale));
     }
   }
-
   const lines = rows.map(row =>
     row.map((cell, i) => clip(cell, colWidths[i]).padEnd(colWidths[i] ?? 0)).join(' | ')
   );
-
   if (headerRowCount > 0 && lines.length > headerRowCount) {
     const sep = colWidths.map(w => '-'.repeat(w)).join('-+-');
     lines.splice(headerRowCount, 0, sep);
   }
-
   return lines.join('\n');
 }
 
-// Разбивает данные на чанки, каждый из которых влезает в один embed
-function buildTableEmbeds(url, allRows, headerRowCount, title, footerText) {
-  const header = allRows.slice(0, headerRowCount);
-  const data   = allRows.slice(headerRowCount);
+function buildTableEmbeds(url, allRows, title, footerText) {
+  const header = allRows.slice(0, 1);
+  const data   = allRows.slice(1);
   const chunks = [];
   let cur = [];
-
   for (const row of data) {
     const candidate = [...header, ...cur, row];
-    const text = formatTable(candidate, headerRowCount);
+    const text = formatTable(candidate, 1);
     if (text && ('```\n' + text + '\n```').length > MAX_DESC_LEN && cur.length > 0) {
       chunks.push([...header, ...cur]);
       cur = [row];
@@ -109,21 +107,17 @@ function buildTableEmbeds(url, allRows, headerRowCount, title, footerText) {
     new EmbedBuilder()
       .setTitle(chunks.length > 1 ? `${title} (${i + 1}/${chunks.length})` : title)
       .setURL(url)
-      .setDescription('```\n' + formatTable(chunk, headerRowCount) + '\n```')
+      .setDescription('```\n' + formatTable(chunk, 1) + '\n```')
       .setFooter({ text: i === chunks.length - 1 ? footerText : '\u200b' })
       .setTimestamp()
   );
 }
 
-// ---------- Получение и построение embed для семьи ----------
-
 async function buildFamilyEmbeds(url, familyId, server, period, intervalSec) {
-  const data = await fetchFamilyStats(familyId, server, period);
+  const { roster } = await fetchFamilyData(familyId, server);
+  if (!Array.isArray(roster) || roster.length === 0) throw new Error('Пустой список игроков');
 
-  // roster — массив игроков с полями: name, avgDamage, totalDamage, totalKills, captsPlayed
-  const roster = data.roster || data;
-  if (!Array.isArray(roster) || roster.length === 0) throw new Error('Пустой roster');
-
+  // Фильтруем по периоду если сервер отдаёт все периоды
   const headers = ['#', 'Игрок', 'Ср.урон', 'Общ.урон', 'Убийств', 'Каптов'];
   const rows = roster.map((p, i) => [
     String(i + 1),
@@ -135,12 +129,9 @@ async function buildFamilyEmbeds(url, familyId, server, period, intervalSec) {
   ]);
 
   const periodLabel = period === 'week' ? 'Неделя' : period === 'month' ? 'Месяц' : 'Сезон';
-  const allRows = [headers, ...rows];
-
   return buildTableEmbeds(
     url,
-    allRows,
-    1,
+    [headers, ...rows],
     `📊 Статистика семьи — ${periodLabel}`,
     `Обновляется каждые ${intervalSec} сек. • игроков: ${roster.length}`
   );
@@ -154,7 +145,6 @@ async function updateWatch(watchId) {
   try {
     const channel = await client.channels.fetch(watch.channelId);
     const embeds  = await buildFamilyEmbeds(watch.url, watch.familyId, watch.server, watch.period, watch.intervalMs / 1000);
-
     for (let i = 0; i < embeds.length; i++) {
       if (i < watch.messageIds.length) {
         const msg = await channel.messages.fetch(watch.messageIds[i]);
@@ -178,7 +168,6 @@ client.on('interactionCreate', async (interaction) => {
     return interaction.reply({ content: 'У вас нет прав для использования этой команды.', ephemeral: true });
   }
 
-  // /family url [period] [interval]
   if (interaction.commandName === 'family') {
     const url         = interaction.options.getString('url');
     const period      = interaction.options.getString('period') ?? 'week';
@@ -205,7 +194,6 @@ client.on('interactionCreate', async (interaction) => {
         const msg = await interaction.channel.send({ embeds: [embeds[i]] });
         messageIds.push(msg.id);
       }
-
       const intervalMs = intervalSec * 1000;
       const timer = setInterval(() => updateWatch(first.id), intervalMs);
       watches.set(first.id, { url, familyId, server, period, intervalMs, channelId: first.channelId, messageIds, timer });
@@ -215,23 +203,17 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 
-  // /unwatch message_id
   if (interaction.commandName === 'unwatch') {
     const messageId = interaction.options.getString('message_id');
     const watch = watches.get(messageId);
-    if (!watch) {
-      return interaction.reply({ content: 'Не нахожу такое наблюдение.', ephemeral: true });
-    }
+    if (!watch) return interaction.reply({ content: 'Не нахожу такое наблюдение.', ephemeral: true });
     clearInterval(watch.timer);
     watches.delete(messageId);
     await interaction.reply({ content: 'Обновление остановлено.', ephemeral: true });
   }
 
-  // /listwatches
   if (interaction.commandName === 'listwatches') {
-    if (watches.size === 0) {
-      return interaction.reply({ content: 'Нет активных наблюдений.', ephemeral: true });
-    }
+    if (watches.size === 0) return interaction.reply({ content: 'Нет активных наблюдений.', ephemeral: true });
     const lines = [...watches.entries()].map(
       ([id, w]) => `• \`${id}\` — семья ${w.familyId} (${w.server}, ${w.period}, каждые ${w.intervalMs / 1000} сек.)`
     );

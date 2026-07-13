@@ -1,0 +1,16 @@
+{
+  "name": "discord-html-watcher",
+  "version": "2.0.0",
+  "description": "Discord-бот для отображения статистики семьи Majestic RP",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "deploy": "node deploy-commands.js",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.4.5",
+    "node-fetch": "^2.7.0"
+  }
+}

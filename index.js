@@ -1,5 +1,6 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const crypto = require('crypto');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const watches = new Map();
@@ -20,7 +21,73 @@ function hasPermission(interaction) {
   return interaction.member.roles.cache.some(r => allowedRoles.includes(r.id));
 }
 
-// ---------- Парсинг данных из HTML страницы ----------
+// ---------- Обход анти-DDoS защиты (react.su) ----------
+
+// Кэш: хост -> { cookie, expires }
+const cookieCache = new Map();
+
+function computeReactCookie(html) {
+  // Извлекаем три hex-значения из скрипта анти-DDoS
+  const hexValues = [...html.matchAll(/toNumbers\("([0-9a-f]{32})"\)/g)].map(m => m[1]);
+  if (hexValues.length < 3) return null;
+  const [keyHex, ivHex, ctHex] = hexValues;
+  const key  = Buffer.from(keyHex, 'hex');
+  const iv   = Buffer.from(ivHex, 'hex');
+  const ct   = Buffer.from(ctHex, 'hex');
+  try {
+    const dec = crypto.createDecipheriv('aes-128-cbc', key, iv);
+    dec.setAutoPadding(false);
+    return Buffer.concat([dec.update(ct), dec.final()]).toString('hex');
+  } catch (e) {
+    return null;
+  }
+}
+
+async function fetchWithAntiDDOS(url) {
+  const host = new URL(url).hostname;
+  const baseHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'ru-RU,ru;q=0.9',
+  };
+
+  // Попытка 1: если есть кэшированная cookie — используем её
+  const cached = cookieCache.get(host);
+  if (cached && cached.expires > Date.now()) {
+    const res = await fetchFn(url, {
+      headers: { ...baseHeaders, 'Cookie': `R3ACTLB=${cached.cookie}` }
+    });
+    const html = await res.text();
+    if (!html.includes('Проверяем ваш браузер') && html.includes('__next_f')) {
+      return html;
+    }
+  }
+
+  // Попытка 2: загружаем страницу без cookie — должны получить анти-DDoS
+  const res1 = await fetchFn(url, { headers: baseHeaders });
+  const html1 = await res1.text();
+
+  if (html1.includes('toNumbers') && html1.includes('R3ACTLB')) {
+    // Вычисляем cookie через AES расшифровку
+    const cookieVal = computeReactCookie(html1);
+    if (!cookieVal) throw new Error('Не удалось вычислить anti-DDoS cookie');
+
+    // Кэшируем на 12 часов
+    cookieCache.set(host, { cookie: cookieVal, expires: Date.now() + 12 * 60 * 60 * 1000 });
+
+    // Повторный запрос уже с cookie
+    await new Promise(r => setTimeout(r, 2000)); // небольшая пауза как у браузера
+    const res2 = await fetchFn(url, {
+      headers: { ...baseHeaders, 'Cookie': `R3ACTLB=${cookieVal}` }
+    });
+    return await res2.text();
+  }
+
+  // Страница уже не антиДДОС — возвращаем как есть
+  return html1;
+}
+
+// ---------- Парсинг данных из HTML ----------
 
 function parseFamilyUrl(url) {
   const m = url.match(/\/family\/(\d+)/);
@@ -29,30 +96,21 @@ function parseFamilyUrl(url) {
   return { familyId: m[1], server: s ? s[1] : 'ru7' };
 }
 
+function extractRosterFromHtml(html) {
+  // Данные встроены в Next.js RSC payload: "roster":[{...}]
+  const match = html.match(/"roster":\[(\{.+?\}(?:,\{.+?\})*)\]/);
+  if (!match) throw new Error('Список игроков не найден на странице');
+  return JSON.parse('[' + match[1] + ']');
+}
+
 async function fetchFamilyData(familyId, server) {
-  const url = `https://fletcher-wiki.com/players-family-stats/family/${familyId}?server=${server}`;
-  const res = await fetchFn(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'ru-RU,ru;q=0.9',
-    }
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const html = await res.text();
-
-  // Данные встроены в HTML как Next.js RSC payload
-  // Ищем JSON с initialData
-  const match = html.match(/\"initialData\":\{\"family\":\{(.+?)\},\"roster\":\[(.+?)\]\}/);
-  if (!match) {
-    // Запасной вариант: ищем roster напрямую
-    const rosterMatch = html.match(/\"roster\":\[(\{.+?\}(?:,\{.+?\})*)\]/);
-    if (!rosterMatch) throw new Error('Не удалось найти данные на странице. Возможно, сайт заблокировал запрос.');
-    return { roster: JSON.parse('[' + rosterMatch[1] + ']'), family: null };
+  const url  = `https://fletcher-wiki.com/players-family-stats/family/${familyId}?server=${server}`;
+  const html = await fetchWithAntiDDOS(url);
+  if (!html.includes('__next_f') && !html.includes('roster')) {
+    throw new Error('Страница не загрузилась корректно. Попробуйте позже.');
   }
-
-  const roster = JSON.parse('[' + match[2] + ']');
-  return { roster, family: null };
+  const roster = extractRosterFromHtml(html);
+  return roster;
 }
 
 // ---------- Форматирование таблицы ----------
@@ -102,7 +160,6 @@ function buildTableEmbeds(url, allRows, title, footerText) {
     }
   }
   if (cur.length > 0) chunks.push([...header, ...cur]);
-
   return chunks.map((chunk, i) =>
     new EmbedBuilder()
       .setTitle(chunks.length > 1 ? `${title} (${i + 1}/${chunks.length})` : title)
@@ -114,10 +171,9 @@ function buildTableEmbeds(url, allRows, title, footerText) {
 }
 
 async function buildFamilyEmbeds(url, familyId, server, period, intervalSec) {
-  const { roster } = await fetchFamilyData(familyId, server);
+  const roster = await fetchFamilyData(familyId, server);
   if (!Array.isArray(roster) || roster.length === 0) throw new Error('Пустой список игроков');
 
-  // Фильтруем по периоду если сервер отдаёт все периоды
   const headers = ['#', 'Игрок', 'Ср.урон', 'Общ.урон', 'Убийств', 'Каптов'];
   const rows = roster.map((p, i) => [
     String(i + 1),
